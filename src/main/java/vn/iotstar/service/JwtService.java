@@ -1,19 +1,19 @@
 package vn.iotstar.service;
 
-import io.jsonwebtoken.Claims;
-import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.io.Decoders;
-import io.jsonwebtoken.security.Keys;
+import com.nimbusds.jose.*;
+import com.nimbusds.jose.crypto.MACSigner;
+import com.nimbusds.jose.crypto.MACVerifier;
+import com.nimbusds.jwt.JWTClaimsSet;
+import com.nimbusds.jwt.SignedJWT;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.stereotype.Service;
 
-import javax.crypto.SecretKey;
 import java.nio.charset.StandardCharsets;
+import java.text.ParseException;
 import java.util.Date;
 import java.util.HashMap;
 import java.util.Map;
-import java.util.function.Function;
 
 @Service
 public class JwtService {
@@ -25,12 +25,12 @@ public class JwtService {
     private long jwtExpiration;
 
     public String extractUsername(String token) {
-        return extractClaim(token, Claims::getSubject);
-    }
-
-    public <T> T extractClaim(String token, Function<Claims, T> claimsResolver) {
-        final Claims claims = extractAllClaims(token);
-        return claimsResolver.apply(claims);
+        try {
+            SignedJWT signedJWT = parseToken(token);
+            return signedJWT.getJWTClaimsSet().getSubject();
+        } catch (ParseException e) {
+            return null;
+        }
     }
 
     public String generateToken(UserDetails userDetails) {
@@ -38,58 +38,96 @@ public class JwtService {
     }
 
     public String generateToken(Map<String, Object> extraClaims, UserDetails userDetails) {
-        return buildToken(extraClaims, userDetails, jwtExpiration);
+        try {
+            JWSSigner signer = new MACSigner(getSigningKeyBytes());
+
+            Date now = new Date();
+            Date expiryDate = new Date(now.getTime() + jwtExpiration);
+
+            JWTClaimsSet.Builder builder = new JWTClaimsSet.Builder()
+                    .subject(userDetails.getUsername())
+                    .issuer("HCMUTE_WEBPR330479")
+                    .issueTime(now)
+                    .expirationTime(expiryDate);
+
+            if (extraClaims != null) {
+                extraClaims.forEach(builder::claim);
+            }
+
+            JWTClaimsSet claimsSet = builder.build();
+
+            SignedJWT signedJWT = new SignedJWT(
+                    new JWSHeader(JWSAlgorithm.HS256),
+                    claimsSet
+            );
+
+            signedJWT.sign(signer);
+            return signedJWT.serialize();
+        } catch (JOSEException e) {
+            throw new RuntimeException("Error signing JWT with Nimbus: " + e.getMessage(), e);
+        }
     }
 
     public long getExpirationTime() {
         return jwtExpiration;
     }
 
-    private String buildToken(
-            Map<String, Object> extraClaims,
-            UserDetails userDetails,
-            long expiration
-    ) {
-        return Jwts.builder()
-                .claims(extraClaims)
-                .subject(userDetails.getUsername())
-                .issuedAt(new Date(System.currentTimeMillis()))
-                .expiration(new Date(System.currentTimeMillis() + expiration))
-                .signWith(getSignInKey())
-                .compact();
-    }
-
     public boolean isTokenValid(String token, UserDetails userDetails) {
-        final String username = extractUsername(token);
-        return (username.equals(userDetails.getUsername())) && !isTokenExpired(token);
-    }
-
-    private boolean isTokenExpired(String token) {
-        return extractExpiration(token).before(new Date());
-    }
-
-    private Date extractExpiration(String token) {
-        return extractClaim(token, Claims::getExpiration);
-    }
-
-    private Claims extractAllClaims(String token) {
-        return Jwts.parser()
-                .verifyWith(getSignInKey())
-                .build()
-                .parseSignedClaims(token)
-                .getPayload();
-    }
-
-    private SecretKey getSignInKey() {
-        byte[] keyBytes;
         try {
-            keyBytes = Decoders.BASE64.decode(secretKey);
-            if (keyBytes.length < 32) {
-                keyBytes = secretKey.getBytes(StandardCharsets.UTF_8);
+            SignedJWT signedJWT = parseToken(token);
+            JWSVerifier verifier = new MACVerifier(getSigningKeyBytes());
+
+            // 1. Verify Nimbus HMAC signature
+            if (!signedJWT.verify(verifier)) {
+                return false;
             }
-        } catch (Exception e) {
-            keyBytes = secretKey.getBytes(StandardCharsets.UTF_8);
+
+            // 2. Verify Subject matches UserDetails
+            String username = signedJWT.getJWTClaimsSet().getSubject();
+            if (username == null || !username.equals(userDetails.getUsername())) {
+                return false;
+            }
+
+            // 3. Verify Expiration
+            Date expirationTime = signedJWT.getJWTClaimsSet().getExpirationTime();
+            return expirationTime != null && !expirationTime.before(new Date());
+
+        } catch (ParseException | JOSEException e) {
+            return false;
         }
-        return Keys.hmacShaKeyFor(keyBytes);
+    }
+
+    public SignedJWT parseToken(String token) throws ParseException {
+        return SignedJWT.parse(token);
+    }
+
+    public JWTClaimsSet extractAllClaims(String token) throws ParseException {
+        return parseToken(token).getJWTClaimsSet();
+    }
+
+    private byte[] getSigningKeyBytes() {
+        try {
+            // Check if secretKey is 64-character hex string
+            if (secretKey.matches("^[0-9a-fA-F]{64,}$")) {
+                int len = secretKey.length();
+                byte[] data = new byte[len / 2];
+                for (int i = 0; i < len; i += 2) {
+                    data[i / 2] = (byte) ((Character.digit(secretKey.charAt(i), 16) << 4)
+                            + Character.digit(secretKey.charAt(i + 1), 16));
+                }
+                if (data.length >= 32) {
+                    return data;
+                }
+            }
+        } catch (Exception ignored) {
+        }
+
+        byte[] raw = secretKey.getBytes(StandardCharsets.UTF_8);
+        if (raw.length < 32) {
+            byte[] padded = new byte[32];
+            System.arraycopy(raw, 0, padded, 0, raw.length);
+            return padded;
+        }
+        return raw;
     }
 }
